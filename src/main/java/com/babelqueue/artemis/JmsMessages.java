@@ -9,16 +9,20 @@ import jakarta.jms.TextMessage;
 
 /**
  * Projects the envelope's contract fields onto a native JMS message ({@code JMSType} = URN,
- * {@code JMSCorrelationID} = {@code trace_id}, plus the {@code bq-} string properties) and reads
+ * {@code JMSCorrelationID} = {@code trace_id}, plus the {@code bq_} string properties) and reads
  * the native metadata back. The body stays the canonical envelope (Contract §7.2–§7.3).
+ *
+ * <p>The {@code bq_} property names use <strong>underscores</strong>, not hyphens: a JMS property
+ * name must be a valid Java identifier (no {@code -}), and every Artemis SDK uses the same
+ * JMS-legal form for cross-protocol parity.
  */
 final class JmsMessages {
 
-    static final String SCHEMA_VERSION = "bq-schema-version";
-    static final String SOURCE_LANG = "bq-source-lang";
-    static final String ATTEMPTS = "bq-attempts";
-    static final String APP_ID = "bq-app-id";
-    static final String DELAY = "bq-delay";
+    static final String SCHEMA_VERSION = "bq_schema_version";
+    static final String SOURCE_LANG = "bq_source_lang";
+    static final String ATTEMPTS = "bq_attempts";
+    static final String APP_ID = "bq_app_id";
+    static final String DELAY = "bq_delay";
     static final String DELIVERY_COUNT = "JMSXDeliveryCount";
     static final String APP_ID_VALUE = "babelqueue";
 

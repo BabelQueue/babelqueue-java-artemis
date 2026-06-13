@@ -54,10 +54,10 @@ class ArtemisPublisherTest {
 
         verify(message).setJMSType(URN);
         verify(message).setJMSCorrelationID("trace-1");
-        verify(message).setStringProperty("bq-schema-version", "1");
-        verify(message).setStringProperty("bq-source-lang", decoded.meta().lang());
-        verify(message).setStringProperty("bq-attempts", "0");
-        verify(message).setStringProperty("bq-app-id", "babelqueue");
+        verify(message).setStringProperty("bq_schema_version", "1");
+        verify(message).setStringProperty("bq_source_lang", decoded.meta().lang());
+        verify(message).setStringProperty("bq_attempts", "0");
+        verify(message).setStringProperty("bq_app_id", "babelqueue");
         verify(producer).send(message);
     }
 
@@ -70,7 +70,7 @@ class ArtemisPublisherTest {
         ArtemisPublisher.create(session, producer).publish(URN, Map.of(), null, Duration.ofSeconds(30));
 
         verify(producer).setDeliveryDelay(30000L);
-        verify(message).setStringProperty("bq-delay", "30000");
+        verify(message).setStringProperty("bq_delay", "30000");
         verify(producer).send(message);
         verify(producer).setDeliveryDelay(0L);
     }
