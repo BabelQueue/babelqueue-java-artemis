@@ -90,6 +90,14 @@
             <version>20240303</version>
             <scope>test</scope>
         </dependency>
+        <!-- Live-broker client for the opt-in ArtemisIntegrationTest (skipped unless BQ_INTEGRATION=1);
+             test scope only, never shipped. -->
+        <dependency>
+            <groupId>org.apache.activemq</groupId>
+            <artifactId>artemis-jakarta-client</artifactId>
+            <version>2.37.0</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
