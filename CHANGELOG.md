@@ -7,6 +7,20 @@ this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.htm
 The envelope wire format is versioned separately by `meta.schema_version`
 (currently **1**) — see the contract at [babelqueue.com](https://babelqueue.com).
 
+## [Unreleased]
+
+### Fixed
+
+- `ArtemisConsumer` now applies the §7.7 schema-version gate **before** decoding the body: when the
+  `bq_schema_version` JMS string property is present and is not the supported version (`1`), the message
+  is never decoded and the handler is never called; it is reported via `onError` (with a `null` envelope),
+  its raw body is forwarded to `<queue>.dlq` (when configured) and it is acknowledged. A missing or blank
+  property (empty or ASCII-whitespace-only) keeps the existing decode path. Cross-SDK parity (GR-5): the
+  value is compared exactly, with no trimming.
+  If the DLQ write fails, the session is `recover()`ed instead of acknowledging (CLIENT_ACKNOWLEDGE is
+  session-wide, so a later message's `acknowledge()` would otherwise swallow the rejected one) and the
+  failure goes to `onError`; the message is redelivered and rejected again, never lost.
+
 ## [1.0.0] - 2026-06-13
 
 ### Added

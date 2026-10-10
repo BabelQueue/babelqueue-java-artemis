@@ -27,13 +27,26 @@ import java.util.function.BooleanSupplier;
  * {@code max(body, JMSXDeliveryCount − 1)} — {@code JMSXDeliveryCount} is the broker-maintained,
  * 1-based authoritative counter.
  *
+ * <p>Per §7.7 the {@code bq_schema_version} string property is checked <b>before</b> the body is
+ * decoded: when it is present, not blank (empty or ASCII-whitespace-only) and not exactly
+ * {@link EnvelopeCodec#SCHEMA_VERSION} (compared as sent, no trimming), the message is never decoded and
+ * the handler is never called — {@code onError} is notified (with a {@code null} envelope), the raw body
+ * is forwarded to the DLQ (when configured) and the message is acknowledged — but only after the DLQ write succeeded. If it fails, the session is
+ * {@code recover()}ed (the message is redelivered and rejected again, never lost, never handled — a later
+ * message's session-wide {@code acknowledge()} cannot swallow it) and the failure goes to {@code onError}.
+ * An absent or blank property
+ * changes nothing, and the post-decode {@link EnvelopeCodec#accepts} check still applies.
+ *
  * <p>Process one message per {@link #poll()} so the per-message {@code acknowledge()} and
  * {@code recover()} stay correct under the session-wide ack model. Not thread-safe — a JMS
  * session is single-threaded; run one per thread.
  */
 public final class ArtemisConsumer {
 
-    /** Notified of a non-conformant message, an unmapped URN, or a throwing handler. */
+    /**
+     * Notified of a non-conformant message, an unmapped URN, a throwing handler, or a message rejected by the
+     * §7.7 schema-version gate. {@code envelope} is {@code null} when the body was not decoded.
+     */
     @FunctionalInterface
     public interface ErrorHandler {
         void onError(Throwable error, Envelope envelope, Message message);
@@ -87,6 +100,32 @@ public final class ArtemisConsumer {
     }
 
     private void handle(Message message) throws JMSException {
+        String declaredVersion = message.getStringProperty(JmsMessages.SCHEMA_VERSION);
+        if (declaredVersion != null && !isBlankSchemaVersion(declaredVersion)
+            && !declaredVersion.equals(Integer.toString(EnvelopeCodec.SCHEMA_VERSION))) {
+            // §7.7: reject WITHOUT decoding — never best-effort parse an unknown schema.
+            BabelQueueException rejected = new BabelQueueException("Rejected a BabelQueue message with unsupported "
+                + JmsMessages.SCHEMA_VERSION + " property '" + declaredVersion + "' (supported: "
+                + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded.");
+            // CLIENT_ACKNOWLEDGE is session-wide: a later message's acknowledge() would also acknowledge this
+            // one. So if the DLQ write fails, force redelivery (recover) instead of leaving it unacknowledged —
+            // the message is never lost and never reaches the handler; it is rejected again when redelivered.
+            // Settle first, report afterwards, so a throwing onError cannot bypass the ack/recover protection.
+            try {
+                deadLetterRaw(message);
+            } catch (JMSException | RuntimeException dlqFailure) {
+                session.recover();
+                report(rejected, null, message);
+                report(new BabelQueueException("Could not dead-letter a message rejected by the "
+                    + JmsMessages.SCHEMA_VERSION + " gate; not acknowledged, session recovered for redelivery.",
+                    dlqFailure), null, message);
+                return;
+            }
+            message.acknowledge();
+            report(rejected, null, message);
+            return;
+        }
+
         Envelope envelope = reconcile(EnvelopeCodec.decode(JmsMessages.text(message)), message);
 
         if (!EnvelopeCodec.accepts(envelope)) {
@@ -169,6 +208,21 @@ public final class ArtemisConsumer {
         }
         TextMessage forwarded = session.createTextMessage(JmsMessages.text(message));
         dlqProducer.send(session.createQueue(dlqQueue), forwarded);
+    }
+
+    /**
+     * The shared cross-SDK "blank" definition for {@code bq_schema_version}: the empty string, or a value made up
+     * <b>only</b> of ASCII whitespace ({@code ' '}, {@code \t}, {@code \n}, U+000B, {@code \f}, {@code \r}). Anything else
+     * (NBSP, U+001C–U+001F, U+0085, U+FEFF, …) is <b>not</b> blank, unlike {@link String#isBlank()}.
+     */
+    private static boolean isBlankSchemaVersion(String value) {
+        for (int i = 0; i < value.length(); i++) {
+            char c = value.charAt(i);
+            if (c != ' ' && (c < '\t' || c > '\r')) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static String urn(Message message, Envelope envelope) {

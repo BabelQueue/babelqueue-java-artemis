@@ -2,10 +2,14 @@ package com.babelqueue.artemis;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertInstanceOf;
+import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertThrows;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -15,12 +19,15 @@ import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
+import jakarta.jms.JMSException;
 import jakarta.jms.Message;
 import jakarta.jms.MessageConsumer;
 import jakarta.jms.MessageProducer;
 import jakarta.jms.Queue;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -265,5 +272,143 @@ class ArtemisConsumerTest {
         MessageConsumer consumer = mock(MessageConsumer.class);
         ArtemisConsumer.builder(consumer, mock(Session.class)).build().run(() -> false);
         verify(consumer, never()).receive(anyLong());
+    }
+
+    // ---- §7.7 schema-version gate -------------------------------------------------------------
+
+    @Test
+    void schemaVersionGateDecodesWhenPropertyMissingBlankOrSupported() throws Exception {
+        String[] versions = {null, "", " \t", "\n\u000b\f\r", "1"};
+        for (String version : versions) {
+            TextMessage message = incoming(body(0), URN, 1);
+            when(message.getStringProperty("bq_schema_version")).thenReturn(version);
+            int[] handled = {0};
+
+            ArtemisConsumer.builder(consumerWith(message), mock(Session.class))
+                .handler(URN, (env, m) -> handled[0]++)
+                .build()
+                .poll();
+
+            assertEquals(1, handled[0], "version=" + version);
+            verify(message).acknowledge();
+        }
+    }
+
+    @Test
+    void schemaVersionGateRejectsWithoutDecodingOrHandler() throws Exception {
+        for (String version : new String[] {"2", "x"}) {
+            // A non-JSON body proves the body is never decoded: decoding it would throw out of poll().
+            TextMessage message = incoming("not-json", URN, 1);
+            when(message.getStringProperty("bq_schema_version")).thenReturn(version);
+            Session session = mock(Session.class);
+            TextMessage forwarded = mock(TextMessage.class);
+            when(session.createTextMessage("not-json")).thenReturn(forwarded);
+            when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+            MessageProducer dlqProducer = mock(MessageProducer.class);
+            int[] handled = {0};
+            List<Throwable> errors = new ArrayList<>();
+            List<Envelope> envelopes = new ArrayList<>();
+
+            ArtemisConsumer.builder(consumerWith(message), session)
+                .deadLetterQueue(dlqProducer, "orders.dlq")
+                .handler(URN, (env, m) -> handled[0]++)
+                .onError((e, env, m) -> {
+                    errors.add(e);
+                    envelopes.add(env);
+                })
+                .build()
+                .poll();
+
+            assertEquals(0, handled[0], "version=" + version);
+            assertEquals(1, errors.size());
+            assertTrue(errors.get(0).getMessage().contains("unsupported"), errors.get(0).getMessage());
+            assertNull(envelopes.get(0));
+            verify(dlqProducer).send(any(Queue.class), eq(forwarded));
+            verify(message).acknowledge();
+        }
+    }
+
+    @Test
+    void schemaVersionGateDlqFailureRecoversSessionInsteadOfAcknowledging() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+        when(session.createTextMessage("not-json")).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        doThrow(new JMSException("dlq unavailable")).when(dlqProducer).send(any(Queue.class), any(Message.class));
+        int[] handled = {0};
+        List<Throwable> errors = new ArrayList<>();
+
+        int count = ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .handler(URN, (env, m) -> handled[0]++)
+            .onError((e, env, m) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(1, count);
+        assertEquals(0, handled[0]);
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+        assertEquals(2, errors.size());
+        assertTrue(errors.get(0).getMessage().contains("unsupported"), errors.get(0).getMessage());
+        assertTrue(errors.get(1).getMessage().contains("session recovered"), errors.get(1).getMessage());
+        assertEquals("dlq unavailable", errors.get(1).getCause().getMessage());
+    }
+
+    @Test
+    void schemaVersionGateWithoutDlqStillAcknowledges() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+
+        ArtemisConsumer.builder(consumerWith(message), session).handler(URN, (env, m) -> { }).build().poll();
+
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+    }
+
+    @Test
+    void schemaVersionGateThrowingOnErrorStillRecoversWhenDlqFails() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+        when(session.createTextMessage("not-json")).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        doThrow(new JMSException("dlq unavailable")).when(dlqProducer).send(any(Queue.class), any(Message.class));
+        int[] handled = {0};
+
+        ArtemisConsumer worker = ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .handler(URN, (env, m) -> handled[0]++)
+            .onError((e, env, m) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        assertEquals(0, handled[0]);
+        verify(session).recover();
+        verify(message, never()).acknowledge();
+    }
+
+    @Test
+    void schemaVersionGateThrowingOnErrorStillAcknowledgesAfterDlqSuccess() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+        when(session.createTextMessage("not-json")).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+
+        ArtemisConsumer worker = ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .onError((e, env, m) -> { throw new IllegalArgumentException("onError blew up"); })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        verify(dlqProducer).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+        verify(session, never()).recover();
     }
 }

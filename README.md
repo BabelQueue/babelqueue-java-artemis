@@ -111,6 +111,13 @@ The `bq-` property values are strings (integers as decimal, e.g. `"1"`); `bq-app
 `"babelqueue"`. The envelope is unchanged (`schema_version` stays `1`); Artemis is purely
 additive.
 
+**Schema-version gate (§7.7).** Before decoding the body the consumer reads the JMS string property
+`bq_schema_version` (underscores — JMS forbids hyphens in property names, ADR-0017). Absent or blank
+(empty / ASCII whitespace only) → normal decode. Any other value that is not exactly `1` (no
+trimming — `"2"`, `"x"`, `" 1"`) → the message is **not** decoded and the handler is not called:
+`onError` is notified with a `null` envelope, the raw body is forwarded to `<queue>.dlq` (if
+configured) and the message is acknowledged.
+
 ## Build & test
 
 ```bash

@@ -1,15 +1,21 @@
 package com.babelqueue.artemis;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import jakarta.jms.MessageConsumer;
+import jakarta.jms.MessageProducer;
+import jakarta.jms.Queue;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
 import java.io.InputStream;
@@ -93,6 +99,48 @@ class ArtemisConformanceTest {
                 .poll();
 
             assertEquals(testCase.getInt("expected_attempts"), seen[0], testCase.getString("name"));
+        }
+    }
+
+    @Test
+    void schemaVersionGateMatchesGolden() throws Exception {
+        JSONObject gate = artemisBlock().getJSONObject("schema_version_gate");
+        String property = gate.getString("property");
+        String fixture = resource(gate.getString("fixture"));
+        JSONArray cases = gate.getJSONArray("cases");
+        assertTrue(cases.length() > 0);
+
+        for (int i = 0; i < cases.length(); i++) {
+            JSONObject testCase = cases.getJSONObject(i);
+            boolean decode = "decode".equals(testCase.getString("expect"));
+            String label = testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
+
+            TextMessage message = mock(TextMessage.class);
+            when(message.getText()).thenReturn(fixture);
+            when(message.getJMSType()).thenReturn(URN);
+            if (testCase.has("value")) {
+                when(message.getStringProperty(property)).thenReturn(testCase.getString("value"));
+            }
+            Session session = mock(Session.class);
+            when(session.createTextMessage(anyString())).thenReturn(mock(TextMessage.class));
+            when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+            MessageProducer dlqProducer = mock(MessageProducer.class);
+            MessageConsumer consumer = mock(MessageConsumer.class);
+            when(consumer.receive(anyLong())).thenReturn(message);
+
+            int[] handled = {0};
+            ArtemisConsumer.builder(consumer, session)
+                .deadLetterQueue(dlqProducer, "orders.dlq")
+                .handler(URN, (envelopeIn, messageIn) -> handled[0]++)
+                .build()
+                .poll();
+
+            assertEquals(decode ? 1 : 0, handled[0], label);
+            // Reject = poison path: raw body to the DLQ, then acknowledge. Decode = handler then acknowledge.
+            verify(dlqProducer, times(decode ? 0 : 1)).send(
+                any(Queue.class), any(jakarta.jms.Message.class));
+            verify(message, times(1)).acknowledge();
+            verify(session, never()).recover();
         }
     }
 }
