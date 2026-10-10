@@ -46,14 +46,18 @@ JMS client (`org.apache.activemq:artemis-jakarta-client`), which supplies both t
 ConnectionFactory factory = new org.apache.activemq.artemis.jms.client.ActiveMQJMSConnectionFactory(
     "tcp://localhost:61616");
 
-try (JMSContext ctx = factory.createContext("user", "pass")) {
-    Session session = ctx.createSession(Session.CLIENT_ACKNOWLEDGE);
+try (Connection connection = factory.createConnection("user", "pass")) {
+    Session session = connection.createSession(false, Session.CLIENT_ACKNOWLEDGE);
     MessageProducer producer = session.createProducer(session.createQueue("orders"));
 
     String id = ArtemisPublisher.create(session, producer)
         .publish("urn:babel:orders:created", Map.of("order_id", 1042));
 }
 ```
+
+`ArtemisPublisher` takes a classic JMS `Session` (from `Connection.createSession`), not a
+`JMSContext`. `publish(...)` throws the checked `JMSException`, so declare `throws JMSException`
+on the enclosing method (or catch it).
 
 `publish(urn, data)` returns the message `meta.id`; overloads add a `traceId` and a relative
 `Duration delay` (native `setDeliveryDelay`).
