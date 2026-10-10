@@ -113,12 +113,21 @@ class ArtemisConformanceTest {
         for (int i = 0; i < cases.length(); i++) {
             JSONObject testCase = cases.getJSONObject(i);
             boolean decode = "decode".equals(testCase.getString("expect"));
-            String label = testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
+            boolean jsonNull = testCase.has("value") && testCase.isNull("value");
+            String label = jsonNull ? "null" : testCase.has("value") ? "value=" + testCase.getString("value") : "absent";
 
             TextMessage message = mock(TextMessage.class);
             when(message.getText()).thenReturn(fixture);
             when(message.getJMSType()).thenReturn(URN);
-            if (testCase.has("value")) {
+            if (jsonNull) {
+                // A JMS property set to null reads back as null from getStringProperty — the same as an
+                // absent property (§7.7: null value = property absent). The property is stubbed as PRESENT
+                // (propertyExists = true, getObjectProperty = null) so this case stays distinct from the
+                // "absent" case, where Mockito's default propertyExists = false applies.
+                when(message.propertyExists(property)).thenReturn(true);
+                when(message.getObjectProperty(property)).thenReturn(null);
+                when(message.getStringProperty(property)).thenReturn(null);
+            } else if (testCase.has("value")) {
                 when(message.getStringProperty(property)).thenReturn(testCase.getString("value"));
             }
             Session session = mock(Session.class);
