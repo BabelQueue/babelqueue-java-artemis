@@ -37,6 +37,10 @@ import java.util.function.BooleanSupplier;
  * An absent or blank property
  * changes nothing, and the post-decode {@link EnvelopeCodec#accepts} check still applies.
  *
+ * <p>The same rule holds for every other DLQ write (a non-conformant envelope, an unmapped URN under
+ * {@code dead_letter}, a handler that exhausted max-tries): the message is acknowledged only after the DLQ write
+ * succeeded; otherwise the session is {@code recover()}ed and the failure goes to {@code onError}.
+ *
  * <p>Process one message per {@link #poll()} so the per-message {@code acknowledge()} and
  * {@code recover()} stay correct under the session-wide ack model. Not thread-safe — a JMS
  * session is single-threaded; run one per thread.
@@ -131,8 +135,7 @@ public final class ArtemisConsumer {
         if (!EnvelopeCodec.accepts(envelope)) {
             report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Artemis."),
                 envelope, message);
-            deadLetterRaw(message);
-            message.acknowledge();
+            settle(message, envelope, () -> deadLetterRaw(message), "dead-letter a non-conformant message");
             return;
         }
 
@@ -166,8 +169,8 @@ public final class ArtemisConsumer {
         switch (unknownUrn) {
             case UnknownUrnStrategy.DELETE -> message.acknowledge();
             case UnknownUrnStrategy.DEAD_LETTER -> {
-                deadLetter(envelope, message, "unknown_urn", null);
-                message.acknowledge();
+                settle(message, envelope, () -> deadLetter(envelope, message, "unknown_urn", null),
+                    "dead-letter a message with an unmapped URN");
             }
             case UnknownUrnStrategy.RELEASE -> session.recover();
             // FAIL (default): surface and do NOT acknowledge — the broker redelivers, then DLAs.
@@ -183,11 +186,35 @@ public final class ArtemisConsumer {
             // Leave it unacknowledged and force redelivery — the broker increments JMSXDeliveryCount.
             session.recover();
         } else if (dlqQueue != null && dlqProducer != null) {
-            deadLetter(envelope, message, "failed", error);
-            message.acknowledge();
+            settle(message, envelope, () -> deadLetter(envelope, message, "failed", error),
+                "dead-letter a failed message");
         } else {
             message.acknowledge(); // terminal, no DLQ → degrade to drop
         }
+    }
+
+    /**
+     * Run a DLQ write, then acknowledge. If the write fails the message is <b>not</b> acknowledged and the session is
+     * {@code recover()}ed so the broker redelivers it (a later message's session-wide {@code acknowledge()} could
+     * otherwise swallow it); the failure goes to {@code onError}. Recover first, report afterwards, so a throwing
+     * {@code onError} cannot bypass the protection.
+     */
+    private void settle(Message message, Envelope envelope, DlqWrite write, String action) throws JMSException {
+        try {
+            write.run();
+        } catch (JMSException | RuntimeException dlqFailure) {
+            session.recover();
+            report(new BabelQueueException("Could not " + action + "; not acknowledged, session recovered for redelivery.",
+                dlqFailure), envelope, message);
+            return;
+        }
+        message.acknowledge();
+    }
+
+    /** A DLQ write that may fail with a JMS or runtime exception. */
+    @FunctionalInterface
+    private interface DlqWrite {
+        void run() throws JMSException;
     }
 
     private void deadLetter(Envelope envelope, Message message, String reason, Throwable error) throws JMSException {

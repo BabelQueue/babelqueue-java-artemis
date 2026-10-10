@@ -411,4 +411,118 @@ class ArtemisConsumerTest {
         verify(message).acknowledge();
         verify(session, never()).recover();
     }
+
+    // -- DLQ write failure on the non-gate paths: never acknowledge past an unconfirmed write ----------------
+
+    private static Session sessionWithDlq(MessageProducer failingProducer) throws Exception {
+        Session session = mock(Session.class);
+        when(session.createTextMessage(anyString())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        doThrow(new JMSException("dlq unavailable")).when(failingProducer).send(any(Queue.class), any(Message.class));
+        return session;
+    }
+
+    @Test
+    void nonConformantDlqFailureRecoversInsteadOfAcknowledging() throws Exception {
+        Envelope base = EnvelopeCodec.decode(body(0));
+        // Decodable but non-conformant: blank trace_id.
+        String nonConformant = EnvelopeCodec.encode(
+            new Envelope(base.job(), "", base.data(), base.meta(), 0, base.deadLetter()));
+        TextMessage message = incoming(nonConformant, null, 1);
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = sessionWithDlq(dlqProducer);
+        List<Throwable> errors = new ArrayList<>();
+
+        int count = ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .onError((e, env, m) -> errors.add(e))
+            .build()
+            .poll();
+
+        assertEquals(1, count);
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+        assertEquals(2, errors.size());
+        assertTrue(errors.get(1).getMessage().contains("session recovered"), errors.get(1).getMessage());
+        assertEquals("dlq unavailable", errors.get(1).getCause().getMessage());
+    }
+
+    @Test
+    void unknownUrnDeadLetterFailureRecoversInsteadOfAcknowledging() throws Exception {
+        TextMessage message = incoming(body(0), URN, 1);
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = sessionWithDlq(dlqProducer);
+        List<Throwable> errors = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+            .onError((e, env, m) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+        assertEquals(1, errors.size());
+        assertTrue(errors.get(0).getMessage().contains("session recovered"), errors.get(0).getMessage());
+    }
+
+    @Test
+    void terminalFailureDlqFailureRecoversInsteadOfAcknowledging() throws Exception {
+        TextMessage message = incoming(body(2), URN, 3); // attempts 2, nextAttempt 3 == maxTries -> DLQ
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = sessionWithDlq(dlqProducer);
+        List<Throwable> errors = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .maxTries(3)
+            .onError((e, env, m) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+        assertEquals(2, errors.size()); // the handler's own error + the DLQ write failure
+        assertTrue(errors.get(1).getMessage().contains("session recovered"), errors.get(1).getMessage());
+    }
+
+    @Test
+    void terminalFailureRuntimeDlqFailureAlsoRecovers() throws Exception {
+        TextMessage message = incoming(body(2), URN, 3);
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = mock(Session.class);
+        when(session.createTextMessage(anyString())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        doThrow(new IllegalStateException("producer closed")).when(dlqProducer).send(any(Queue.class), any(Message.class));
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .maxTries(3)
+            .build()
+            .poll();
+
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+    }
+
+    @Test
+    void dlqFailureWithThrowingOnErrorStillRecovers() throws Exception {
+        TextMessage message = incoming(body(2), URN, 3);
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = sessionWithDlq(dlqProducer);
+
+        ArtemisConsumer worker = ArtemisConsumer.builder(consumerWith(message), session)
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .maxTries(3)
+            .onError((e, env, m) -> { if (e instanceof com.babelqueue.BabelQueueException) { throw new IllegalArgumentException("onError blew up"); } })
+            .build();
+
+        assertThrows(IllegalArgumentException.class, worker::poll);
+        verify(session).recover();
+        verify(message, never()).acknowledge();
+    }
 }

@@ -9,6 +9,15 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+### Fixed
+
+- `ArtemisConsumer` no longer risks losing a message when a DLQ write fails on the non-gate paths
+  (non-conformant envelope, unmapped URN under `dead_letter`, handler failure after max-tries). The
+  `JMSException` escaped without `recover()`, leaving the message unacknowledged on a `CLIENT_ACKNOWLEDGE`
+  session where a later message's session-wide `acknowledge()` silently acknowledged it too. The message is
+  now acknowledged only after the DLQ write succeeded; otherwise the session is `recover()`ed (redelivery) and
+  the failure is reported via `onError` - the same protection the §7.7 gate already had.
+
 ## [1.0.1] - 2026-10-10
 
 ### Fixed
