@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-10-10
+
 ### Fixed
 
 - `ArtemisConsumer` now applies the §7.7 schema-version gate **before** decoding the body: when the
