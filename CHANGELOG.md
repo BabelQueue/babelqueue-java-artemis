@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-10-11
+
 ### Fixed
 
 - `ArtemisConsumer` no longer risks losing a message when a DLQ write fails on the non-gate paths
