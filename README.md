@@ -32,14 +32,9 @@ them instead of re-implementing them (the envelope stays `schema_version: 1`):
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-artemis</artifactId>
-  <version>1.0.2</version>
+  <version>1.0.3</version>
 </dependency>
 ```
-
-> **ADR-0031 behaviour needs core 1.11.0.** This release resolves `babelqueue-core` 1.8.0 transitively, which
-> predates the ADR-0031 decode behaviour (the `job` + `urn` warning, the closed ASCII blank set, encode-time
-> rejection of invalid extension keys). To get it, add `babelqueue-core` >= 1.11.0 as a direct dependency; the
-> pin will be raised in the next PATCH release.
 
 It pulls `babelqueue-core` transitively. The JMS API is `provided`-style — bring your Artemis
 JMS client (`org.apache.activemq:artemis-jakarta-client`), which supplies both the
