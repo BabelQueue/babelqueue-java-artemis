@@ -162,7 +162,7 @@ public final class ArtemisConsumer {
             return envelope;
         }
         int delivered = count - 1;
-        return delivered > envelope.attempts() ? withAttempts(envelope, delivered) : envelope;
+        return delivered > envelope.attempts() ? envelope.withAttempts(delivered) : envelope;
     }
 
     private void onUnknownUrn(Message message, Envelope envelope, String urn) throws JMSException {
@@ -259,10 +259,6 @@ public final class ArtemisConsumer {
 
     private static String originalQueue(Envelope envelope) {
         return envelope.meta() != null && envelope.meta().queue() != null ? envelope.meta().queue() : "";
-    }
-
-    private static Envelope withAttempts(Envelope e, int attempts) {
-        return new Envelope(e.job(), e.traceId(), e.data(), e.meta(), attempts, e.deadLetter());
     }
 
     private void report(Throwable error, Envelope envelope, Message message) {

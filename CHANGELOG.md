@@ -9,6 +9,16 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-10-17
+
+### Fixed
+
+- Unknown top-level keys and unknown `meta` keys (ADR-0031 extension keys, e.g. `extra_top`, `meta.vendor_flag`) are no longer dropped when `ArtemisConsumer` reconciles `attempts` with `JMSXDeliveryCount`: the envelope is now rebuilt with `Envelope.withAttempts`, which carries the extras, instead of the 6-argument constructor. The extras therefore also survive into the dead-letter copy. Regression tests cover both paths.
+
+### Changed
+
+- The `babelqueue-core` dependency is raised from 1.0.0 to 1.8.0, the first core release whose `Envelope` carries extras and exposes `withAttempts`.
+
 ## [1.0.2] - 2026-10-11
 
 ### Fixed

@@ -140,6 +140,50 @@ class ArtemisConsumerTest {
         assertEquals("failed", dead.deadLetter().reason());
     }
 
+    /** Body carrying a top-level {@code extra_top} and {@code meta.vendor_flag} (ADR-0031). */
+    private static String bodyWithExtras(int attempts) {
+        return "{\"job\":\"" + URN + "\",\"trace_id\":\"trace-1\",\"data\":{\"order_id\":7},"
+            + "\"meta\":{\"id\":\"m-1\",\"queue\":\"orders\",\"lang\":\"php\",\"schema_version\":1,"
+            + "\"created_at\":1700000000000,\"vendor_flag\":true},\"attempts\":" + attempts + ",\"extra_top\":1}";
+    }
+
+    @Test
+    void deliveryCountReconcilePreservesUnknownTopLevelAndMetaKeys() throws Exception {
+        TextMessage message = incoming(bodyWithExtras(0), URN, 3); // reconcile bumps attempts 0 -> 2
+        Envelope[] seen = {null};
+
+        ArtemisConsumer.builder(consumerWith(message), mock(Session.class))
+            .handler(URN, (env, m) -> seen[0] = env)
+            .build()
+            .poll();
+
+        assertEquals(2, seen[0].attempts());
+        assertEquals(1L, seen[0].extras().get("extra_top"));
+        assertEquals(true, seen[0].meta().extras().get("vendor_flag"));
+    }
+
+    @Test
+    void terminalFailureDeadLetterPreservesUnknownKeysAndCarriesReasonAndOriginalQueue() throws Exception {
+        TextMessage message = incoming(bodyWithExtras(0), URN, 3); // reconciled to attempts 2, nextAttempt 3 == maxTries
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> dlqBody = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(dlqBody.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .maxTries(3)
+            .build()
+            .poll();
+
+        Envelope dead = EnvelopeCodec.decode(dlqBody.getValue());
+        assertEquals(1L, dead.extras().get("extra_top"));
+        assertEquals(true, dead.meta().extras().get("vendor_flag"));
+        assertEquals("failed", dead.deadLetter().reason());
+        assertEquals("orders", dead.deadLetter().originalQueue());
+    }
+
     @Test
     void unknownUrnFailRaisesAndDoesNotAcknowledge() throws Exception {
         TextMessage message = incoming(body(0), URN, 1);
