@@ -13,8 +13,48 @@ import org.junit.jupiter.api.Test;
 class JmsMessagesTest {
 
     @Test
-    void textOfNonTextMessageIsEmpty() throws Exception {
-        assertEquals("", JmsMessages.text(mock(Message.class)));
+    void bodyOfNeitherTextNorBytesMessageIsEmpty() throws Exception {
+        assertEquals(0, JmsMessages.bodyBytes(mock(Message.class)).length);
+    }
+
+    @Test
+    void bodyBytesOfATextMessageAreItsUtf8AndEmptyWhenUnset() throws Exception {
+        jakarta.jms.TextMessage text = mock(jakarta.jms.TextMessage.class);
+        when(text.getText()).thenReturn("caf\u00e9");
+        org.junit.jupiter.api.Assertions.assertArrayEquals(
+            "caf\u00e9".getBytes(java.nio.charset.StandardCharsets.UTF_8), JmsMessages.bodyBytes(text));
+        jakarta.jms.TextMessage unset = mock(jakarta.jms.TextMessage.class);
+        assertEquals(0, JmsMessages.bodyBytes(unset).length);
+    }
+
+    @Test
+    void bodyBytesOfABytesMessageAreTheExactContentIncludingInvalidUtf8() throws Exception {
+        byte[] content = {'{', (byte) 0xFF, (byte) 0xFE, '}'};
+        jakarta.jms.BytesMessage bytes = ArtemisConsumerTest.bytesMessage(content);
+        org.junit.jupiter.api.Assertions.assertArrayEquals(content, JmsMessages.bodyBytes(bytes));
+        // reset() before the read and again after it: the message is left readable from the start.
+        org.mockito.Mockito.verify(bytes, org.mockito.Mockito.times(2)).reset();
+    }
+
+    @Test
+    void shortReadsAreAssembledAndAnEarlyEndIsTruncated() throws Exception {
+        jakarta.jms.BytesMessage bytes = mock(jakarta.jms.BytesMessage.class);
+        when(bytes.getBodyLength()).thenReturn(4L);
+        when(bytes.readBytes(org.mockito.ArgumentMatchers.any(byte[].class))).thenAnswer(inv -> {
+            byte[] target = inv.getArgument(0);
+            target[0] = 'a';
+            if (target.length == 4) {
+                return 1; // short read
+            }
+            return -1; // premature end of stream
+        });
+        org.junit.jupiter.api.Assertions.assertArrayEquals(new byte[] {'a'}, JmsMessages.bodyBytes(bytes));
+    }
+
+    @Test
+    void strictUtf8RejectsInvalidBytesWithoutSubstitution() {
+        assertEquals("ok", JmsMessages.strictUtf8("ok".getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+        assertNull(JmsMessages.strictUtf8(new byte[] {(byte) 0xFF}));
     }
 
     @Test

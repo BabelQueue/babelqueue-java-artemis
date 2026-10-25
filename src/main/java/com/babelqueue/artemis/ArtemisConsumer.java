@@ -8,6 +8,7 @@ import com.babelqueue.JsonValues;
 import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
+import jakarta.jms.BytesMessage;
 import jakarta.jms.JMSException;
 import jakarta.jms.Message;
 import jakarta.jms.MessageConsumer;
@@ -159,7 +160,10 @@ public final class ArtemisConsumer {
             return;
         }
 
-        Envelope envelope = reconcile(EnvelopeCodec.decode(JmsMessages.text(message)), message);
+        // Strict UTF-8 over the exact body bytes (a TextMessage's text or a BytesMessage's content): a body that is not
+        // valid UTF-8 is never decoded leniently, it is poison (ADR-0037 decision 2).
+        String text = JmsMessages.strictUtf8(JmsMessages.bodyBytes(message));
+        Envelope envelope = reconcile(EnvelopeCodec.decode(text == null ? "" : text), message);
 
         if (!EnvelopeCodec.accepts(envelope)) {
             BabelQueueException cause = new BabelQueueException(
@@ -284,14 +288,14 @@ public final class ArtemisConsumer {
 
     /** Writes the ADR-0035 record of a poison body to the DLQ. */
     private void deadLetterPoison(Message message, Throwable cause) throws JMSException {
-        String record = poisonRecord(JmsMessages.text(message).getBytes(StandardCharsets.UTF_8),
+        String record = poisonRecord(JmsMessages.bodyBytes(message),
             consumedQueue(message), Math.max(JmsMessages.deliveryCount(message) - 1, 0), cause);
         dlqProducer.send(session.createQueue(dlqQueue), session.createTextMessage(record));
     }
 
     /**
-     * The ADR-0035 DLQ record of a poison {@code body}: the one builder this consumer writes with (conformance
-     * {@code poison_dlq} drives it directly for bodies a JMS text message cannot carry, such as invalid UTF-8).
+     * The ADR-0035 DLQ record of a poison {@code body}: the one builder this consumer writes with (every conformance
+     * {@code poison_dlq} case reaches it through {@link #poll()}, invalid UTF-8 as a {@code BytesMessage}).
      */
     static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
         Map<String, Object> block = new LinkedHashMap<>();
@@ -324,7 +328,16 @@ public final class ArtemisConsumer {
         if (!deadLetterEnabled()) {
             return;
         }
-        TextMessage forwarded = session.createTextMessage(JmsMessages.text(message));
+        byte[] body = JmsMessages.bodyBytes(message);
+        Message forwarded;
+        if (message instanceof BytesMessage) {
+            // Keep the message kind: the bytes (valid UTF-8 or not) are forwarded exactly as received.
+            BytesMessage bytes = session.createBytesMessage();
+            bytes.writeBytes(body);
+            forwarded = bytes;
+        } else {
+            forwarded = session.createTextMessage(new String(body, StandardCharsets.UTF_8));
+        }
         dlqProducer.send(session.createQueue(dlqQueue), forwarded);
     }
 

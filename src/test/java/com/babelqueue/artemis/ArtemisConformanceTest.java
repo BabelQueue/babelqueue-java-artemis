@@ -166,35 +166,35 @@ class ArtemisConformanceTest {
         for (int i = 0; i < cases.length(); i++) {
             JSONObject testCase = cases.getJSONObject(i);
             String name = testCase.getString("name");
-            String record;
+            // Every case, invalid UTF-8 included, goes through the consumer: a text body arrives as a TextMessage,
+            // raw bytes (an AMQP 1.0 Data section) as a BytesMessage.
+            jakarta.jms.Message message;
             if (testCase.has("body_base64")) {
-                // A JMS text message cannot carry bytes that are not valid UTF-8: drive the builder the consumer
-                // writes with directly.
-                record = ArtemisConsumer.poisonRecord(PoisonRecordChecks.bodyOf(testCase), "orders", 0,
-                    new com.babelqueue.BabelQueueException("poison"));
+                message = ArtemisConsumerTest.bytesMessage(PoisonRecordChecks.bodyOf(testCase));
             } else {
-                TextMessage message = mock(TextMessage.class);
-                when(message.getText()).thenReturn(testCase.getString("body"));
-                Session session = mock(Session.class);
-                ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
-                when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
-                when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
-                MessageProducer dlqProducer = mock(MessageProducer.class);
-                MessageConsumer consumer = mock(MessageConsumer.class);
-                when(consumer.receive(anyLong())).thenReturn(message);
-                int[] handled = {0};
-
-                ArtemisConsumer.builder(consumer, session)
-                    .deadLetterQueue(dlqProducer, "orders.dlq")
-                    .handler(URN, (envelopeIn, messageIn) -> handled[0]++)
-                    .build()
-                    .poll();
-
-                assertEquals(0, handled[0], name);
-                verify(dlqProducer, times(1)).send(any(Queue.class), any(jakarta.jms.Message.class));
-                verify(message, times(1)).acknowledge();
-                record = written.getValue();
+                TextMessage text = mock(TextMessage.class);
+                when(text.getText()).thenReturn(testCase.getString("body"));
+                message = text;
             }
+            Session session = mock(Session.class);
+            ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+            when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+            when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+            MessageProducer dlqProducer = mock(MessageProducer.class);
+            MessageConsumer consumer = mock(MessageConsumer.class);
+            when(consumer.receive(anyLong())).thenReturn(message);
+            int[] handled = {0};
+
+            ArtemisConsumer.builder(consumer, session)
+                .deadLetterQueue(dlqProducer, "orders.dlq")
+                .handler(URN, (envelopeIn, messageIn) -> handled[0]++)
+                .build()
+                .poll();
+
+            assertEquals(0, handled[0], name);
+            verify(dlqProducer, times(1)).send(any(Queue.class), any(jakarta.jms.Message.class));
+            verify(message, times(1)).acknowledge();
+            String record = written.getValue();
             PoisonRecordChecks.check(testCase, record);
         }
     }

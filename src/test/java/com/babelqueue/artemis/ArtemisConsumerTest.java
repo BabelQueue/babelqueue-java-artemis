@@ -54,6 +54,24 @@ class ArtemisConsumerTest {
         return message;
     }
 
+    /** A received {@code BytesMessage} (what an AMQP 1.0 Data section arrives as) holding exactly {@code content}. */
+    static jakarta.jms.BytesMessage bytesMessage(byte[] content) throws Exception {
+        jakarta.jms.BytesMessage message = mock(jakarta.jms.BytesMessage.class);
+        when(message.getBodyLength()).thenReturn((long) content.length);
+        when(message.readBytes(any(byte[].class))).thenAnswer(invocation -> {
+            byte[] target = invocation.getArgument(0);
+            System.arraycopy(content, 0, target, 0, Math.min(target.length, content.length));
+            return Math.min(target.length, content.length);
+        });
+        return message;
+    }
+
+    private static MessageConsumer consumerWithAny(Message message) throws Exception {
+        MessageConsumer consumer = mock(MessageConsumer.class);
+        when(consumer.receive(anyLong())).thenReturn(message);
+        return consumer;
+    }
+
     private static MessageConsumer consumerWith(TextMessage message) throws Exception {
         MessageConsumer consumer = mock(MessageConsumer.class);
         when(consumer.receive(anyLong())).thenReturn(message);
@@ -733,5 +751,115 @@ class ArtemisConsumerTest {
         assertThrows(IllegalArgumentException.class, worker::poll);
         verify(session).recover();
         verify(message, never()).acknowledge();
+    }
+    // ---- BytesMessage bodies (AMQP 1.0 Data section): the bytes are never lost -------------------
+
+    @Test
+    void validEnvelopeInABytesMessageIsRoutedAndAcknowledged() throws Exception {
+        jakarta.jms.BytesMessage message = bytesMessage(body(0).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        when(message.getJMSType()).thenReturn(URN);
+        int[] handled = {0};
+
+        ArtemisConsumer.builder(consumerWithAny(message), mock(Session.class))
+            .handler(URN, (env, m) -> handled[0]++)
+            .build()
+            .poll();
+
+        assertEquals(1, handled[0]);
+        verify(message).acknowledge();
+    }
+
+    @Test
+    void bytesMessageReachesTheHandlerRewoundToItsStart() throws Exception {
+        jakarta.jms.BytesMessage message = bytesMessage(body(0).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        when(message.getJMSType()).thenReturn(URN);
+        org.mockito.InOrder order = org.mockito.Mockito.inOrder(message);
+        boolean[] rewound = {false};
+
+        ArtemisConsumer.builder(consumerWithAny(message), mock(Session.class))
+            .handler(URN, (env, m) -> {
+                // The last reset() before the handler runs is the one that rewinds the body for it.
+                order.verify(message, org.mockito.Mockito.atLeastOnce()).reset();
+                rewound[0] = true;
+            })
+            .build()
+            .poll();
+
+        assertTrue(rewound[0]);
+        // reset() both before and after the read.
+        verify(message, org.mockito.Mockito.times(2)).reset();
+    }
+
+    @Test
+    void poisonBytesMessageThatIsNotUtf8KeepsItsBytesInTheRecord() throws Exception {
+        byte[] content = {(byte) 0xFF, (byte) 0xFE, 'a'};
+        jakarta.jms.BytesMessage message = bytesMessage(content);
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        int[] handled = {0};
+
+        ArtemisConsumer.builder(consumerWithAny(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .handler(URN, (env, m) -> handled[0]++)
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        org.json.JSONObject record = new org.json.JSONObject(written.getValue());
+        assertEquals("//5h", record.getString("raw"));
+        assertEquals("base64", record.getString("raw_encoding"));
+        assertEquals("poison", record.getJSONObject("dead_letter").getString("reason"));
+        verify(dlqProducer).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+    }
+
+    @Test
+    void validEnvelopeWithOneInvalidUtf8ByteIsPoisonNotDecodedLeniently() throws Exception {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("note", "ab"), "orders", null));
+        byte[] content = json.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+        content[json.indexOf("ab")] = (byte) 0xFF;
+        jakarta.jms.BytesMessage message = bytesMessage(content);
+        when(message.getJMSType()).thenReturn(URN);
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        int[] handled = {0};
+
+        ArtemisConsumer.builder(consumerWithAny(message), session)
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .handler(URN, (env, m) -> handled[0]++)
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        org.json.JSONObject record = new org.json.JSONObject(written.getValue());
+        assertEquals(java.util.Base64.getEncoder().encodeToString(content), record.getString("raw"));
+        assertEquals("base64", record.getString("raw_encoding"));
+    }
+
+    @Test
+    void versionGatedBytesMessageIsForwardedAsBytesExactly() throws Exception {
+        byte[] content = {'{', (byte) 0xFF, '}'};
+        jakarta.jms.BytesMessage message = bytesMessage(content);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+        jakarta.jms.BytesMessage forwarded = mock(jakarta.jms.BytesMessage.class);
+        when(session.createBytesMessage()).thenReturn(forwarded);
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+
+        ArtemisConsumer.builder(consumerWithAny(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .build()
+            .poll();
+
+        verify(forwarded).writeBytes(content);
+        verify(dlqProducer).send(any(Queue.class), org.mockito.ArgumentMatchers.eq(forwarded));
+        verify(message).acknowledge();
     }
 }
