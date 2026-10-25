@@ -4,15 +4,20 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import com.babelqueue.JsonValues;
+import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
 import jakarta.jms.JMSException;
 import jakarta.jms.Message;
 import jakarta.jms.MessageConsumer;
 import jakarta.jms.MessageProducer;
+import jakarta.jms.Queue;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
+import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -27,25 +32,36 @@ import java.util.function.BooleanSupplier;
  * {@code max(body, JMSXDeliveryCount − 1)} — {@code JMSXDeliveryCount} is the broker-maintained,
  * 1-based authoritative counter.
  *
- * <p>Per §7.7 the {@code bq_schema_version} string property is checked <b>before</b> the body is
- * decoded: when it is present, not blank (empty or ASCII-whitespace-only) and not exactly
- * {@link EnvelopeCodec#SCHEMA_VERSION} (compared as sent, no trimming), the message is never decoded and
- * the handler is never called — {@code onError} is notified (with a {@code null} envelope), the raw body
- * is forwarded to the DLQ (when configured) and the message is acknowledged — but only after the DLQ write succeeded. If it fails, the session is
- * {@code recover()}ed (the message is redelivered and rejected again, never lost, never handled — a later
- * message's session-wide {@code acknowledge()} cannot swallow it) and the failure goes to {@code onError}.
- * An absent or blank property
+ * <p><b>Version gate (§7.7, ADR-0037 decision 1).</b> The {@code bq_schema_version} string property is checked
+ * <b>before</b> the body is decoded: when it is present, not blank (empty or ASCII-whitespace-only) and not exactly
+ * {@link EnvelopeCodec#SCHEMA_VERSION} (compared as sent, no trimming), the message is never decoded, the handler is
+ * never called and nothing is retried, on its first delivery whatever {@code JMSXDeliveryCount} says. {@code onError}
+ * is notified (with a {@code null} envelope). Under the {@code delete} {@link Builder#unknownUrn strategy} it is
+ * acknowledged. Otherwise, with a {@link Builder#deadLetterQueue dead-letter queue}, the body is forwarded to the DLQ
+ * <b>exactly as received</b> (no {@code dead_letter} block) and the message acknowledged — but only after the DLQ write
+ * succeeded; if it fails, the session is {@code recover()}ed (the message is redelivered and rejected again, never
+ * lost, never handled — a later message's session-wide {@code acknowledge()} cannot swallow it) and the failure goes
+ * to {@code onError}. With no dead-letter queue it is acknowledged and the drop is logged. An absent or blank property
  * changes nothing, and the post-decode {@link EnvelopeCodec#accepts} check still applies.
  *
- * <p>The same rule holds for every other DLQ write (a non-conformant envelope, an unmapped URN under
- * {@code dead_letter}, a handler that exhausted max-tries): the message is acknowledged only after the DLQ write
- * succeeded; otherwise the session is {@code recover()}ed and the failure goes to {@code onError}.
+ * <p><b>Poison (ADR-0037 decision 2).</b> A body that is not a valid envelope (not JSON, no valid identity, an
+ * unsupported {@code meta.schema_version}) is never handed to a handler and never retried. Under {@code delete} it is
+ * acknowledged; with a dead-letter queue the ADR-0035 record ({@link PoisonRecord}, {@code reason: "poison"},
+ * {@code original_queue} = the consumed queue) is written to it and the message acknowledged only after the write
+ * succeeded (same recover-on-failure rule as above); with no dead-letter queue it is acknowledged and the drop is
+ * logged.
+ *
+ * <p>The same acknowledge-only-after-the-write rule holds for every other DLQ write (an unmapped URN under
+ * {@code dead_letter}, a handler that exhausted max-tries): otherwise the session is {@code recover()}ed and the
+ * failure goes to {@code onError}.
  *
  * <p>Process one message per {@link #poll()} so the per-message {@code acknowledge()} and
  * {@code recover()} stay correct under the session-wide ack model. Not thread-safe — a JMS
  * session is single-threaded; run one per thread.
  */
 public final class ArtemisConsumer {
+
+    private static final System.Logger LOGGER = System.getLogger(ArtemisConsumer.class.getName());
 
     /**
      * Notified of a non-conformant message, an unmapped URN, a throwing handler, or a message rejected by the
@@ -111,6 +127,19 @@ public final class ArtemisConsumer {
             BabelQueueException rejected = new BabelQueueException("Rejected a BabelQueue message with unsupported "
                 + JmsMessages.SCHEMA_VERSION + " property '" + declaredVersion + "' (supported: "
                 + EnvelopeCodec.SCHEMA_VERSION + "); body not decoded.");
+            if (UnknownUrnStrategy.DELETE.equals(unknownUrn)) {
+                message.acknowledge();
+                report(rejected, null, message);
+                return;
+            }
+            if (!deadLetterEnabled()) {
+                LOGGER.log(System.Logger.Level.WARNING,
+                    "BabelQueue Artemis: dropped a version-gated message (no dead-letter queue configured): {0}",
+                    rejected.getMessage());
+                message.acknowledge();
+                report(rejected, null, message);
+                return;
+            }
             // CLIENT_ACKNOWLEDGE is session-wide: a later message's acknowledge() would also acknowledge this
             // one. So if the DLQ write fails, force redelivery (recover) instead of leaving it unacknowledged —
             // the message is never lost and never reaches the handler; it is rejected again when redelivered.
@@ -133,9 +162,10 @@ public final class ArtemisConsumer {
         Envelope envelope = reconcile(EnvelopeCodec.decode(JmsMessages.text(message)), message);
 
         if (!EnvelopeCodec.accepts(envelope)) {
-            report(new BabelQueueException("Rejected a non-conformant BabelQueue envelope from Artemis."),
-                envelope, message);
-            settle(message, envelope, () -> deadLetterRaw(message), "dead-letter a non-conformant message");
+            BabelQueueException cause = new BabelQueueException(
+                "Rejected a non-conformant BabelQueue envelope from Artemis.");
+            report(cause, envelope, message);
+            settlePoison(message, envelope, cause);
             return;
         }
 
@@ -153,6 +183,25 @@ public final class ArtemisConsumer {
             report(error, envelope, message);
             retryOrDeadLetter(message, envelope, error);
         }
+    }
+
+    /**
+     * Settles a poison body (ADR-0037 decision 2): acknowledged under {@code delete}, written to the DLQ as the
+     * ADR-0035 record and acknowledged after the write, or acknowledged and logged when no DLQ is configured.
+     */
+    private void settlePoison(Message message, Envelope envelope, Throwable cause) throws JMSException {
+        if (UnknownUrnStrategy.DELETE.equals(unknownUrn)) {
+            message.acknowledge();
+            return;
+        }
+        if (!deadLetterEnabled()) {
+            LOGGER.log(System.Logger.Level.WARNING,
+                "BabelQueue Artemis: dropped a poison message (no dead-letter queue configured): {0}",
+                cause.getMessage());
+            message.acknowledge();
+            return;
+        }
+        settle(message, envelope, () -> deadLetterPoison(message, cause), "dead-letter a poison message");
     }
 
     /** {@code attempts = max(body, JMSXDeliveryCount − 1)}: count 1 (or absent) keeps the body's count. */
@@ -228,9 +277,51 @@ public final class ArtemisConsumer {
         dlqProducer.send(session.createQueue(dlqQueue), JmsMessages.project(session, annotated));
     }
 
-    /** Forward an undecodable message's raw body to the DLQ (no envelope to annotate). */
+    /** Whether dead-lettering is on: a DLQ producer and queue name are configured. */
+    private boolean deadLetterEnabled() {
+        return dlqQueue != null && dlqProducer != null;
+    }
+
+    /** Writes the ADR-0035 record of a poison body to the DLQ. */
+    private void deadLetterPoison(Message message, Throwable cause) throws JMSException {
+        String record = poisonRecord(JmsMessages.text(message).getBytes(StandardCharsets.UTF_8),
+            consumedQueue(message), Math.max(JmsMessages.deliveryCount(message) - 1, 0), cause);
+        dlqProducer.send(session.createQueue(dlqQueue), session.createTextMessage(record));
+    }
+
+    /**
+     * The ADR-0035 DLQ record of a poison {@code body}: the one builder this consumer writes with (conformance
+     * {@code poison_dlq} drives it directly for bodies a JMS text message cannot carry, such as invalid UTF-8).
+     */
+    static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
+        Map<String, Object> block = new LinkedHashMap<>();
+        block.put("reason", "poison");
+        block.put("error", cause.getMessage());
+        block.put("exception", cause.getClass().getName());
+        block.put("failed_at", System.currentTimeMillis());
+        block.put("original_queue", originalQueue);
+        block.put("attempts", attempts);
+        block.put("lang", EnvelopeCodec.SOURCE_LANG);
+        return PoisonRecord.build(body, JsonValues.encode(block));
+    }
+
+    /** The consumed queue's name: the message's JMS destination, else the DLQ name without its {@code .dlq} suffix. */
+    private String consumedQueue(Message message) {
+        try {
+            if (message.getJMSDestination() instanceof Queue queue && queue.getQueueName() != null) {
+                return queue.getQueueName();
+            }
+        } catch (JMSException unreadable) {
+            // fall through to the DLQ-derived name
+        }
+        return dlqQueue != null && dlqQueue.endsWith(".dlq")
+            ? dlqQueue.substring(0, dlqQueue.length() - ".dlq".length())
+            : "";
+    }
+
+    /** Forward a version-gated message's raw body to the DLQ, exactly as received (no envelope to annotate). */
     private void deadLetterRaw(Message message) throws JMSException {
-        if (dlqQueue == null || dlqProducer == null) {
+        if (!deadLetterEnabled()) {
             return;
         }
         TextMessage forwarded = session.createTextMessage(JmsMessages.text(message));

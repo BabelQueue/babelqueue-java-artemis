@@ -236,6 +236,171 @@ class ArtemisConsumerTest {
         org.junit.jupiter.api.Assertions.assertNotNull(reported[0]);
     }
 
+    // ---- ADR-0037: poison record and version gate -----------------------------------------------
+
+    @Test
+    void poisonBodyIsWrittenAsTheAdr0035RecordThenAcknowledged() throws Exception {
+        TextMessage message = incoming("{\"not\":\"an envelope\",\"big\":12345678901234567890}", null, 3);
+        Queue source = mock(Queue.class);
+        when(source.getQueueName()).thenReturn("orders");
+        when(message.getJMSDestination()).thenReturn(source);
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        int[] handled = {0};
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .handler(URN, (env, m) -> handled[0]++)
+            .build()
+            .poll();
+
+        assertEquals(0, handled[0]);
+        verify(dlqProducer).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+        // An object body is spliced: its members stay as written (no re-encoding), plus the dead_letter block.
+        assertTrue(written.getValue().contains("\"big\":12345678901234567890"), written.getValue());
+        org.json.JSONObject block = new org.json.JSONObject(written.getValue()).getJSONObject("dead_letter");
+        assertEquals("poison", block.getString("reason"));
+        assertEquals("orders", block.getString("original_queue"));
+        assertEquals(2, block.getInt("attempts"));
+    }
+
+    @Test
+    void poisonTextMessageWithoutABodyIsRecordedNotLoopedOnRecover() throws Exception {
+        // A TextMessage whose body was never set reads back null: it is poison (empty) and must be dead-lettered
+        // and acknowledged once, not turned into an NPE that recover()s the session for ever.
+        TextMessage message = incoming(null, null, 1);
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .build()
+            .poll();
+
+        verify(dlqProducer).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+        org.json.JSONObject record = new org.json.JSONObject(written.getValue());
+        assertEquals("", record.getString("raw"));
+        assertEquals("poison", record.getJSONObject("dead_letter").getString("reason"));
+    }
+
+    @Test
+    void versionGatedTextMessageWithoutABodyIsForwardedAsEmpty() throws Exception {
+        TextMessage message = incoming(null, URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .build()
+            .poll();
+
+        assertEquals("", written.getValue());
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+    }
+
+    @Test
+    void poisonOriginalQueueFallsBackToTheDlqNameWithoutItsSuffix() throws Exception {
+        TextMessage message = incoming("plain text", null, 1);
+        Session session = mock(Session.class);
+        ArgumentCaptor<String> written = ArgumentCaptor.forClass(String.class);
+        when(session.createTextMessage(written.capture())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .build()
+            .poll();
+
+        org.json.JSONObject record = new org.json.JSONObject(written.getValue());
+        assertEquals("plain text", record.getString("raw"));
+        assertEquals("orders", record.getJSONObject("dead_letter").getString("original_queue"));
+    }
+
+    @Test
+    void poisonWithDeleteStrategyIsAcknowledgedWithoutARecord() throws Exception {
+        TextMessage message = incoming("not-json", null, 1);
+        Session session = mock(Session.class);
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .unknownUrn(UnknownUrnStrategy.DELETE)
+            .build()
+            .poll();
+
+        verify(dlqProducer, never()).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+    }
+
+    @Test
+    void poisonWithoutDlqIsAcknowledgedAndNeverRetried() throws Exception {
+        TextMessage message = incoming("not-json", null, 1);
+        Session session = mock(Session.class);
+
+        ArtemisConsumer.builder(consumerWith(message), session).build().poll();
+
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+    }
+
+    @Test
+    void poisonFailedDlqWriteRecoversTheSessionInsteadOfAcknowledging() throws Exception {
+        TextMessage message = incoming("not-json", null, 1);
+        MessageProducer failing = mock(MessageProducer.class);
+        Session session = sessionWithDlq(failing);
+
+        ArtemisConsumer.builder(consumerWith(message), session).deadLetterQueue(failing, "orders.dlq").build().poll();
+
+        verify(message, never()).acknowledge();
+        verify(session).recover();
+    }
+
+    @Test
+    void versionGatedWithDeleteStrategyIsAcknowledgedWithoutAWrite() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+        Session session = mock(Session.class);
+        List<Throwable> errors = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(message), session)
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .unknownUrn(UnknownUrnStrategy.DELETE)
+            .onError((e, env, m) -> errors.add(e))
+            .build()
+            .poll();
+
+        verify(dlqProducer, never()).send(any(Queue.class), any(Message.class));
+        verify(message).acknowledge();
+        assertEquals(1, errors.size());
+    }
+
+    @Test
+    void versionGatedWithDeadLetterStrategyButNoDlqIsAcknowledgedAndDropped() throws Exception {
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+        Session session = mock(Session.class);
+
+        ArtemisConsumer.builder(consumerWith(message), session).unknownUrn(UnknownUrnStrategy.DEAD_LETTER).build().poll();
+
+        verify(message).acknowledge();
+        verify(session, never()).recover();
+    }
+
     @Test
     void unknownUrnDeadLetterGoesToDlq() throws Exception {
         TextMessage message = incoming(body(0), URN, 1);

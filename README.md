@@ -115,8 +115,16 @@ additive.
 `bq_schema_version` (underscores — JMS forbids hyphens in property names, ADR-0017). Absent or blank
 (empty / ASCII whitespace only) → normal decode. Any other value that is not exactly `1` (no
 trimming — `"2"`, `"x"`, `" 1"`) → the message is **not** decoded and the handler is not called:
-`onError` is notified with a `null` envelope, the raw body is forwarded to `<queue>.dlq` (if
-configured) and the message is acknowledged.
+`onError` is notified with a `null` envelope and the message is settled on its **first** delivery
+(ADR-0037): under the `delete` strategy it is acknowledged; otherwise the raw body is forwarded to
+`<queue>.dlq` **exactly as received** (no `dead_letter` block) and acknowledged after the write succeeded (a
+failed write `recover()`s the session, so it is redelivered and rejected again); with no dead-letter queue it
+is acknowledged and the drop is logged.
+
+**Poison bodies (ADR-0037).** A body that is not a valid envelope (not JSON, no identity, unsupported
+`meta.schema_version`) never reaches a handler and is never retried. With a dead-letter queue it is written to
+`<queue>.dlq` as the ADR-0035 record (`reason: "poison"`; the original body kept, spliced or under `raw`) and
+acknowledged after the write; under `delete`, or with no dead-letter queue, it is acknowledged (and logged).
 
 ## Build & test
 

@@ -48,9 +48,13 @@ final class JmsMessages {
         return message;
     }
 
-    /** The body of a {@link TextMessage}, or empty for any other message type. */
+    /** The body of a {@link TextMessage} (empty when it has none), or empty for any other message type. */
     static String text(Message message) throws JMSException {
-        return message instanceof TextMessage textMessage ? textMessage.getText() : "";
+        if (message instanceof TextMessage textMessage) {
+            String text = textMessage.getText();
+            return text == null ? "" : text;
+        }
+        return "";
     }
 
     /** The {@code JMSType} (the URN), or {@code null} if unset / unreadable. */
