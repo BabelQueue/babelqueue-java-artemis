@@ -6,7 +6,7 @@
 
     <groupId>com.babelqueue</groupId>
     <artifactId>babelqueue-artemis</artifactId>
-    <version>1.1.0</version>
+    <version>1.1.1</version>
     <packaging>jar</packaging>
 
     <name>BabelQueue Apache ActiveMQ Artemis</name>
