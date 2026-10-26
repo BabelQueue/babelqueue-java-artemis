@@ -9,6 +9,36 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-26
+
+MINOR (ADR-0037): poison bodies are dead-lettered as the ADR-0035 record and the version gate follows one
+settle rule. The envelope is unchanged (`schema_version` stays `1`).
+
+### Changed (behaviour)
+
+- **Poison body** (not JSON, not an envelope, no valid identity, or an unsupported `meta.schema_version`):
+  the DLQ record is now the **ADR-0035 record** (`PoisonRecord`: an object body spliced with a `dead_letter`
+  block, `reason: "poison"`, `original_queue` = the consumed queue; any other body under `raw`, base64 with
+  `raw_encoding` when it is not valid UTF-8) instead of a forward of the raw body. It is acknowledged only
+  after the write succeeded (otherwise `recover()`, as before). Under `unknownUrn(DELETE)` it is now
+  acknowledged without a record. With no dead-letter queue it is acknowledged, dropped and **logged**
+  (unchanged, now visible).
+- **Version-gated delivery** (`bq_schema_version` present, not blank, not `1`): settled on the first delivery,
+  never decoded, never retried. The raw body is still forwarded to the DLQ byte for byte (no `dead_letter`
+  block) and acknowledged after the write, but now **not** under `unknownUrn(DELETE)`: that acknowledges it
+  without a record (**dropped**). With no dead-letter queue it is acknowledged, dropped and logged.
+- **`BytesMessage` bodies are read, not dropped.** `JmsMessages.text(...)` treated every non-`TextMessage` as an
+  empty body, so a message from an AMQP 1.0 producer (its Data section arrives as a `BytesMessage`) was decoded as
+  `""`, and a poison one was recorded as `{"raw": ""}` and acknowledged, losing its bytes. The consumer now reads the
+  exact body bytes of a `TextMessage` (UTF-8; empty when unset) or a `BytesMessage` (new `JmsMessages.bodyBytes`)
+  and decodes them with a **strict** UTF-8 check: a valid envelope in a `BytesMessage` is routed normally; a body
+  that is not valid UTF-8 (never decoded leniently) is poison and its exact bytes go to the ADR-0035 record
+  (`raw` base64 with `raw_encoding: "base64"`). A version-gated `BytesMessage` is forwarded to the DLQ as a
+  `BytesMessage` with the same bytes. A `TextMessage` with no body is read as empty instead of `null`.
+- Requires `babelqueue-core` 1.13.0 (was 1.11.0) for `PoisonRecord`.
+- Vendored the cross-SDK conformance suite v1.8.0 (`version_gate_artemis`, `poison_dlq` runners added) and moved
+  the CI pin to it.
+
 ## [1.0.3] - 2026-10-17
 
 ### Fixed

@@ -2,10 +2,15 @@ package com.babelqueue.artemis;
 
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
+import jakarta.jms.BytesMessage;
 import jakarta.jms.JMSException;
 import jakarta.jms.Message;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
+import java.nio.charset.StandardCharsets;
 
 /**
  * Projects the envelope's contract fields onto a native JMS message ({@code JMSType} = URN,
@@ -48,9 +53,53 @@ final class JmsMessages {
         return message;
     }
 
-    /** The body of a {@link TextMessage}, or empty for any other message type. */
-    static String text(Message message) throws JMSException {
-        return message instanceof TextMessage textMessage ? textMessage.getText() : "";
+    /**
+     * The exact body bytes of a received message: the UTF-8 of a {@link TextMessage} text (empty when it has none) or
+     * the content of a {@link BytesMessage} (what an AMQP 1.0 producer's Data section arrives as); empty for any other
+     * message type. Nothing is decoded or substituted, so a body that is not valid UTF-8 keeps its bytes.
+     */
+    static byte[] bodyBytes(Message message) throws JMSException {
+        if (message instanceof TextMessage textMessage) {
+            String text = textMessage.getText();
+            return text == null ? new byte[0] : text.getBytes(StandardCharsets.UTF_8);
+        }
+        if (message instanceof BytesMessage bytesMessage) {
+            bytesMessage.reset();
+            try {
+                long length = bytesMessage.getBodyLength();
+                if (length > Integer.MAX_VALUE - 8) {
+                    throw new JMSException("BytesMessage body too large to read: " + length + " bytes");
+                }
+                byte[] body = new byte[(int) length];
+                int read = 0;
+                while (read < body.length) {
+                    byte[] chunk = new byte[body.length - read];
+                    int n = bytesMessage.readBytes(chunk);
+                    if (n <= 0) {
+                        break;
+                    }
+                    System.arraycopy(chunk, 0, body, read, n);
+                    read += n;
+                }
+                return read == body.length ? body : java.util.Arrays.copyOf(body, read);
+            } finally {
+                // Leave the read position at the start, so a handler given the raw message can read it too.
+                bytesMessage.reset();
+            }
+        }
+        return new byte[0];
+    }
+
+    /** The bytes as text, or {@code null} when they are not valid UTF-8 (never U+FFFD substitution). */
+    static String strictUtf8(byte[] body) {
+        try {
+            return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(body)).toString();
+        } catch (CharacterCodingException invalid) {
+            return null;
+        }
     }
 
     /** The {@code JMSType} (the URN), or {@code null} if unset / unreadable. */
