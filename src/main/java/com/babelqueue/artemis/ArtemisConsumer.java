@@ -4,7 +4,6 @@ import com.babelqueue.BabelQueueException;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
-import com.babelqueue.JsonValues;
 import com.babelqueue.PoisonRecord;
 import com.babelqueue.UnknownUrnException;
 import com.babelqueue.UnknownUrnStrategy;
@@ -18,7 +17,6 @@ import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
 import java.nio.charset.StandardCharsets;
 import java.util.HashMap;
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 import java.util.function.BooleanSupplier;
@@ -298,15 +296,7 @@ public final class ArtemisConsumer {
      * {@code poison_dlq} case reaches it through {@link #poll()}, invalid UTF-8 as a {@code BytesMessage}).
      */
     static String poisonRecord(byte[] body, String originalQueue, int attempts, Throwable cause) {
-        Map<String, Object> block = new LinkedHashMap<>();
-        block.put("reason", "poison");
-        block.put("error", cause.getMessage());
-        block.put("exception", cause.getClass().getName());
-        block.put("failed_at", System.currentTimeMillis());
-        block.put("original_queue", originalQueue);
-        block.put("attempts", attempts);
-        block.put("lang", EnvelopeCodec.SOURCE_LANG);
-        return PoisonRecord.build(body, JsonValues.encode(block));
+        return PoisonRecord.build(body, originalQueue, attempts, cause.getMessage(), cause.getClass().getName());
     }
 
     /** The consumed queue's name: the message's JMS destination, else the DLQ name without its {@code .dlq} suffix. */
