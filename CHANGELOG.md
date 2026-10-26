@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-10-26
+
 MINOR (ADR-0037): poison bodies are dead-lettered as the ADR-0035 record and the version gate follows one
 settle rule. The envelope is unchanged (`schema_version` stays `1`).
 
