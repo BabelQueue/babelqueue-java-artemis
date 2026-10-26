@@ -32,7 +32,7 @@ them instead of re-implementing them (the envelope stays `schema_version: 1`):
 <dependency>
   <groupId>com.babelqueue</groupId>
   <artifactId>babelqueue-artemis</artifactId>
-  <version>1.1.0</version>
+  <version>1.1.1</version>
 </dependency>
 ```
 
