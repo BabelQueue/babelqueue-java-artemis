@@ -11,6 +11,12 @@ import java.nio.ByteBuffer;
 import java.nio.charset.CharacterCodingException;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Enumeration;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
 
 /**
  * Projects the envelope's contract fields onto a native JMS message ({@code JMSType} = URN,
@@ -125,6 +131,79 @@ final class JmsMessages {
             return 0;
         }
         return 0;
+    }
+
+    /** JMS 3.1 §3.5.1: identifiers that may not be used as property names. */
+    private static final Set<String> RESERVED_NAMES = Set.of(
+        "NULL", "TRUE", "FALSE", "NOT", "AND", "OR", "BETWEEN", "LIKE", "IN", "IS", "ESCAPE");
+
+    /**
+     * Whether {@code name} is a legal JMS property name for an out-of-band header: a non-empty Java identifier
+     * that is not a reserved selector word and does not use the {@code JMS}/{@code JMSX} provider namespace.
+     * {@code traceparent} and {@code tracestate} are legal (ADR-0017: hyphenated names are not).
+     */
+    static boolean isLegalPropertyName(String name) {
+        if (name == null || name.isEmpty() || name.startsWith("JMS")
+            || RESERVED_NAMES.contains(name.toUpperCase(java.util.Locale.ROOT))) {
+            return false;
+        }
+        int[] codePoints = name.codePoints().toArray();
+        if (!Character.isJavaIdentifierStart(codePoints[0])) {
+            return false;
+        }
+        for (int cp : codePoints) {
+            if (!Character.isJavaIdentifierPart(cp)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * Adds the out-of-band {@code extra} headers (e.g. {@code traceparent}, ADR-0028) to {@code message} as
+     * string properties beside the contract {@code bq_} properties. Blank keys/values and JMS-illegal names are
+     * skipped, a property already set always wins (the contract is never clobbered), and keys are added in sorted
+     * order so the result is deterministic. A {@code null}/empty map leaves the message untouched.
+     */
+    static void addOutOfBand(Message message, Map<String, String> extra) throws JMSException {
+        if (extra == null || extra.isEmpty()) {
+            return;
+        }
+        List<String> keys = new ArrayList<>(extra.keySet());
+        keys.removeIf(k -> !isLegalPropertyName(k));
+        keys.sort(String::compareTo);
+        for (String key : keys) {
+            String value = extra.get(key);
+            if (value == null || value.isEmpty() || message.propertyExists(key)) {
+                continue;
+            }
+            message.setStringProperty(key, value);
+        }
+    }
+
+    /**
+     * A delivered message's string properties as a flat {@code Map<String, String>} (blank and non-string
+     * values dropped) — the consume-side counterpart of {@link #addOutOfBand}. Both the contract {@code bq_}
+     * properties and out-of-band ones (e.g. {@code traceparent}) surface. Empty when the message is {@code null}
+     * or its properties are unreadable.
+     */
+    static Map<String, String> toMap(Message message) {
+        Map<String, String> out = new LinkedHashMap<>();
+        if (message == null) {
+            return out;
+        }
+        try {
+            Enumeration<?> names = message.getPropertyNames();
+            while (names != null && names.hasMoreElements()) {
+                String name = String.valueOf(names.nextElement());
+                if (message.getObjectProperty(name) instanceof String value && !value.isEmpty()) {
+                    out.put(name, value);
+                }
+            }
+        } catch (JMSException e) {
+            return out;
+        }
+        return out;
     }
 
     private static boolean notBlank(String s) {

@@ -862,4 +862,33 @@ class ArtemisConsumerTest {
         verify(dlqProducer).send(any(Queue.class), org.mockito.ArgumentMatchers.eq(forwarded));
         verify(message).acknowledge();
     }
+
+    @Test
+    @SuppressWarnings("unchecked")
+    void publishedTraceparentReachesTheHandlerViaHeadersOfAndNotTheBody() throws Exception {
+        String traceparent = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+        Map<String, Object> store = new java.util.LinkedHashMap<>();
+        TextMessage sentMessage = ArtemisPublisherTest.storingMessage(store);
+        Session session = mock(Session.class);
+        when(session.createTextMessage(org.mockito.ArgumentMatchers.anyString())).thenReturn(sentMessage);
+        MessageProducer producer = mock(MessageProducer.class);
+        ArtemisPublisher.create(session, producer).publish(URN, Map.of("order_id", 1), "trace-1", null,
+            Map.of("traceparent", traceparent));
+        org.mockito.ArgumentCaptor<String> sentBody = org.mockito.ArgumentCaptor.forClass(String.class);
+        org.mockito.Mockito.verify(session).createTextMessage(sentBody.capture());
+
+        // the broker hands the same message back, with the body the publisher wrote
+        when(sentMessage.getText()).thenReturn(sentBody.getValue());
+        when(sentMessage.getJMSType()).thenReturn(URN);
+        Map<String, String>[] seen = new Map[]{null};
+
+        ArtemisConsumer.builder(consumerWith(sentMessage), mock(Session.class))
+            .handler(URN, (e, m) -> seen[0] = BabelHandler.headersOf(m))
+            .build()
+            .poll();
+
+        assertEquals(traceparent, seen[0].get("traceparent"));
+        assertEquals("0", seen[0].get("bq_attempts"));
+        assertTrue(!sentBody.getValue().contains("traceparent"));
+    }
 }
