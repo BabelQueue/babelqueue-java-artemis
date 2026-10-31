@@ -15,6 +15,8 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
 import com.babelqueue.UnknownUrnException;
@@ -890,5 +892,184 @@ class ArtemisConsumerTest {
         assertEquals(traceparent, seen[0].get("traceparent"));
         assertEquals("0", seen[0].get("bq_attempts"));
         assertTrue(!sentBody.getValue().contains("traceparent"));
+    }
+
+    // ---- ADR-0039 section 5.1 dead-letter observer ----------------------------------------------
+
+    private static Session dlqSession() throws Exception {
+        Session session = mock(Session.class);
+        when(session.createTextMessage(anyString())).thenReturn(mock(TextMessage.class));
+        when(session.createQueue("orders.dlq")).thenReturn(mock(Queue.class));
+        return session;
+    }
+
+    @Test
+    void observerSeesAnExhaustedRetryOnceWithQueueDlqAndReason() throws Exception {
+        TextMessage message = incoming(body(2), URN, 3);
+        List<DeadLetterEvent> events = new ArrayList<>();
+        MessageProducer dlqProducer = mock(MessageProducer.class);
+
+        ArtemisConsumer.builder(consumerWith(message), dlqSession())
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(dlqProducer, "orders.dlq")
+            .maxTries(3)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "failed")), events);
+        verify(message).acknowledge();
+    }
+
+    @Test
+    void observerIsNotCalledWhileTheRetryCapIsNotReached() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(incoming(body(0), URN, 1)), dlqSession())
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .maxTries(3)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerSeesAnUnknownUrnDeadLetter() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(incoming(body(0), URN, 1)), dlqSession())
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "unknown_urn")), events);
+    }
+
+    @Test
+    void observerSeesAPoisonRecord() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(incoming("not-json", null, 1)), dlqSession())
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
+    }
+
+    @Test
+    void observerSeesAVersionGatedRawBodyWithAnEmptyReason() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        TextMessage message = incoming("not-json", URN, 1);
+        when(message.getStringProperty("bq_schema_version")).thenReturn("2");
+
+        ArtemisConsumer.builder(consumerWith(message), dlqSession())
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(new DeadLetterEvent("orders", "orders.dlq", "")), events);
+        verify(message).acknowledge();
+    }
+
+    @Test
+    void observerIsNotCalledWhenTheDlqWriteFails() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+        TextMessage gated = incoming("not-json", URN, 1);
+        when(gated.getStringProperty("bq_schema_version")).thenReturn("2");
+        for (TextMessage message : List.of(gated, incoming("not-json", null, 1), incoming(body(2), URN, 3))) {
+            MessageProducer failing = mock(MessageProducer.class);
+            Session session = sessionWithDlq(failing);
+
+            ArtemisConsumer.builder(consumerWith(message), session)
+                .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+                .deadLetterQueue(failing, "orders.dlq")
+                .maxTries(3)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            verify(session).recover();
+            verify(message, never()).acknowledge();
+        }
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void observerIsNotCalledWhenNoDlqIsConfiguredOrTheStrategyIsDelete() throws Exception {
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(incoming("not-json", null, 1)), mock(Session.class))
+            .deadLetterObserver(events::add).build().poll();
+        ArtemisConsumer.builder(consumerWith(incoming(body(2), URN, 3)), mock(Session.class))
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .maxTries(3).deadLetterObserver(events::add).build().poll();
+        ArtemisConsumer.builder(consumerWith(incoming("not-json", null, 1)), dlqSession())
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .unknownUrn(UnknownUrnStrategy.DELETE)
+            .deadLetterObserver(events::add).build().poll();
+
+        assertTrue(events.isEmpty());
+    }
+
+    @Test
+    void aThrowingObserverDoesNotChangeTheSettleOutcome() throws Exception {
+        DeadLetterObserver boom = event -> { throw new IllegalStateException("observer down"); };
+        DeadLetterObserver fatal = event -> { throw new AssertionError("observer asserts"); };
+
+        for (DeadLetterObserver observer : List.of(boom, fatal)) {
+            TextMessage gated = incoming("not-json", URN, 1);
+            when(gated.getStringProperty("bq_schema_version")).thenReturn("2");
+            for (TextMessage message : List.of(gated, incoming("not-json", null, 1), incoming(body(2), URN, 3))) {
+                Session session = dlqSession();
+                MessageProducer dlqProducer = mock(MessageProducer.class);
+
+                ArtemisConsumer.builder(consumerWith(message), session)
+                    .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+                    .deadLetterQueue(dlqProducer, "orders.dlq")
+                    .maxTries(3)
+                    .deadLetterObserver(observer)
+                    .build()
+                    .poll();
+
+                verify(dlqProducer).send(any(Queue.class), any(Message.class));
+                verify(message).acknowledge();
+                verify(session, never()).recover();
+            }
+        }
+    }
+
+    @Test
+    void eventQueueIsMetaQueueForAnEnvelopeAndTheConsumedQueueForAPoisonRecord() throws Exception {
+        // meta.queue ("billing") differs from the consumed queue ("orders", derived from the DLQ name).
+        Envelope base = EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", "trace-1");
+        String billing = EnvelopeCodec.encode(
+            new Envelope(base.job(), base.traceId(), base.data(), base.meta(), 2, base.deadLetter()));
+        List<DeadLetterEvent> events = new ArrayList<>();
+
+        ArtemisConsumer.builder(consumerWith(incoming(billing, URN, 3)), dlqSession())
+            .handler(URN, (env, m) -> { throw new IllegalStateException("boom"); })
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .maxTries(3)
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+        ArtemisConsumer.builder(consumerWith(incoming("not-json", null, 1)), dlqSession())
+            .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+            .deadLetterObserver(events::add)
+            .build()
+            .poll();
+
+        assertEquals(List.of(
+            new DeadLetterEvent("billing", "orders.dlq", "failed"),
+            new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
     }
 }
