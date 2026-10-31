@@ -1072,4 +1072,28 @@ class ArtemisConsumerTest {
             new DeadLetterEvent("billing", "orders.dlq", "failed"),
             new DeadLetterEvent("orders", "orders.dlq", "poison")), events);
     }
+
+    @Test
+    void eventQueueFallbackTreatsOnlyTheAsciiWhitespaceSetAsBlank() throws Exception {
+        String json = EnvelopeCodec.encode(EnvelopeCodec.make(URN, Map.of("order_id", 1), "billing", "trace-1"));
+        // meta.queue as JSON text -> the queue the event must report. Only the ASCII whitespace set is blank (ADR-0031):
+        // Unicode spaces and control characters (Character.isWhitespace) are real, non-blank names.
+        String[][] cases = {
+            {" \\t", "orders"}, {"", "orders"}, {"\\u000b\\f\\r", "orders"},
+            {"\\u2003", "\u2003"}, {"\\u00a0", "\u00a0"}, {"\\u001c", "\u001c"}, {"\\u0085", "\u0085"},
+        };
+        for (String[] c : cases) {
+            List<DeadLetterEvent> events = new ArrayList<>();
+
+            ArtemisConsumer.builder(consumerWith(incoming(json.replace("\"queue\":\"billing\"", "\"queue\":\"" + c[0] + "\""), null, 1)), dlqSession())
+                .deadLetterQueue(mock(MessageProducer.class), "orders.dlq")
+                .unknownUrn(UnknownUrnStrategy.DEAD_LETTER)
+                .deadLetterObserver(events::add)
+                .build()
+                .poll();
+
+            assertEquals(1, events.size(), c[0]);
+            assertEquals(c[1], events.get(0).queue(), "meta.queue=" + c[0]);
+        }
+    }
 }

@@ -366,7 +366,7 @@ public final class ArtemisConsumer {
     /** {@code meta.queue} when the envelope carries one, else the queue the message was consumed from. */
     private String sourceQueue(Envelope envelope, Message message) {
         String queue = originalQueue(envelope);
-        return queue.isBlank() ? consumedQueue(message) : queue;
+        return EnvelopeCodec.isBlankAscii(queue) ? consumedQueue(message) : queue;
     }
 
     /** Reports a DLQ write the broker just accepted (ADR-0039 section 5.1); an observer failure never escapes. */
