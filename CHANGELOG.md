@@ -9,6 +9,8 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
 ### Added
 
 - **Dead-letter observer (ADR-0039 section 5.1).** `ArtemisConsumer.Builder#deadLetterObserver(DeadLetterObserver)` takes the core's optional `com.babelqueue.DeadLetterObserver` (needs a `babelqueue-core` that ships it). It is called once per record written to the DLQ, right after the send succeeded: an exhausted retry (`failed`), an unmapped URN under `dead_letter` (`unknown_urn`), a poison body (`poison`) and a raw version-gated body (empty `reason`). `DeadLetterEvent.queue` is `meta.queue` when the envelope carries one, else the consumed queue. It is not called when the write fails, when no DLQ is configured, under `delete`, or for a broker-side dead-letter; an observer failure is logged and never changes the settle outcome. Without an observer nothing changes.
