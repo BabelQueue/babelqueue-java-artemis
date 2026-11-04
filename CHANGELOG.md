@@ -9,6 +9,14 @@ The envelope wire format is versioned separately by `meta.schema_version`
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-03
+
+### Added
+
+- **Dead-letter observer (ADR-0039 section 5.1).** `ArtemisConsumer.Builder#deadLetterObserver(DeadLetterObserver)` takes the core's optional `com.babelqueue.DeadLetterObserver` (needs a `babelqueue-core` that ships it). It is called once per record written to the DLQ, right after the send succeeded: an exhausted retry (`failed`), an unmapped URN under `dead_letter` (`unknown_urn`), a poison body (`poison`) and a raw version-gated body (empty `reason`). `DeadLetterEvent.queue` is `meta.queue` when the envelope carries one, else the consumed queue. It is not called when the write fails, when no DLQ is configured, under `delete`, or for a broker-side dead-letter; an observer failure is logged and never changes the settle outcome. Without an observer nothing changes.
+- **W3C `traceparent` out-of-band propagation (ADR-0028).** `ArtemisPublisher`: `publishWithHeaders(Envelope, Map<String,String>)` (the produce-side seam for the core's `com.babelqueue.otel.HeaderSender`) and a `publish(..., Map<String,String> headers)` overload carry out-of-band headers (e.g. `traceparent`, `tracestate`) as JMS string properties beside the contract `bq_` entries. A contract entry always wins a collision; blank keys/values and JMS-illegal property names (e.g. hyphenated, `JMS*`) are skipped; with no/empty headers the message is identical to a plain `publish`. The envelope body is untouched (GR-1, `schema_version` stays 1).
+- `BabelHandler.headersOf(jakarta.jms.Message)` surfaces the delivered JMS string properties as a `Map<String,String>` — the `Supplier` source for `Tracing.wrapHandler(tracer, handler, headers)`, so the consumer span becomes a true child of the producer span. No OpenTelemetry dependency is added (the core's OTel API stays optional).
+
 ## [1.1.1] - 2026-10-26
 
 ### Changed

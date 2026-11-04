@@ -1,6 +1,8 @@
 package com.babelqueue.artemis;
 
 import com.babelqueue.BabelQueueException;
+import com.babelqueue.DeadLetterEvent;
+import com.babelqueue.DeadLetterObserver;
 import com.babelqueue.DeadLetters;
 import com.babelqueue.Envelope;
 import com.babelqueue.EnvelopeCodec;
@@ -54,6 +56,11 @@ import java.util.function.BooleanSupplier;
  * {@code dead_letter}, a handler that exhausted max-tries): otherwise the session is {@code recover()}ed and the
  * failure goes to {@code onError}.
  *
+ * <p>An optional {@link Builder#deadLetterObserver DeadLetterObserver} (ADR-0039 section 5.1) is called once per record
+ * this consumer wrote to the DLQ, right after the send succeeded (exhausted retry, unmapped URN under
+ * {@code dead_letter}, poison body, raw version-gated body). It is not called when the write fails, when no DLQ is
+ * configured, or for a broker-side dead-letter; an observer failure never changes the settle outcome.
+ *
  * <p>Process one message per {@link #poll()} so the per-message {@code acknowledge()} and
  * {@code recover()} stay correct under the session-wide ack model. Not thread-safe — a JMS
  * session is single-threaded; run one per thread.
@@ -80,6 +87,7 @@ public final class ArtemisConsumer {
     private final String unknownUrn;
     private final ErrorHandler onError;
     private final long receiveTimeoutMillis;
+    private final DeadLetterObserver deadLetterObserver;
 
     private ArtemisConsumer(Builder builder) {
         this.consumer = builder.consumer;
@@ -91,6 +99,7 @@ public final class ArtemisConsumer {
         this.unknownUrn = builder.unknownUrn;
         this.onError = builder.onError;
         this.receiveTimeoutMillis = builder.receiveTimeoutMillis;
+        this.deadLetterObserver = builder.deadLetterObserver;
     }
 
     public static Builder builder(MessageConsumer consumer, Session session) {
@@ -277,6 +286,7 @@ public final class ArtemisConsumer {
             error == null ? null : error.getMessage(),
             error == null ? null : error.getClass().getName());
         dlqProducer.send(session.createQueue(dlqQueue), JmsMessages.project(session, annotated));
+        notifyDeadLetter(() -> sourceQueue(envelope, message), reason);
     }
 
     /** Whether dead-lettering is on: a DLQ producer and queue name are configured. */
@@ -289,6 +299,7 @@ public final class ArtemisConsumer {
         String record = poisonRecord(JmsMessages.bodyBytes(message),
             consumedQueue(message), Math.max(JmsMessages.deliveryCount(message) - 1, 0), cause);
         dlqProducer.send(session.createQueue(dlqQueue), session.createTextMessage(record));
+        notifyDeadLetter(() -> consumedQueue(message), "poison");
     }
 
     /**
@@ -329,6 +340,7 @@ public final class ArtemisConsumer {
             forwarded = session.createTextMessage(new String(body, StandardCharsets.UTF_8));
         }
         dlqProducer.send(session.createQueue(dlqQueue), forwarded);
+        notifyDeadLetter(() -> consumedQueue(message), "");
     }
 
     /**
@@ -349,6 +361,20 @@ public final class ArtemisConsumer {
     private static String urn(Message message, Envelope envelope) {
         String type = JmsMessages.type(message);
         return type != null && !type.isEmpty() ? type : EnvelopeCodec.urn(envelope);
+    }
+
+    /** {@code meta.queue} when the envelope carries one, else the queue the message was consumed from. */
+    private String sourceQueue(Envelope envelope, Message message) {
+        String queue = originalQueue(envelope);
+        return EnvelopeCodec.isBlankAscii(queue) ? consumedQueue(message) : queue;
+    }
+
+    /** Reports a DLQ write the broker just accepted (ADR-0039 section 5.1); an observer failure never escapes. */
+    private void notifyDeadLetter(java.util.function.Supplier<String> queue, String reason) {
+        if (deadLetterObserver == null) {
+            return;
+        }
+        DeadLetterObserver.notifySafely(deadLetterObserver, new DeadLetterEvent(queue.get(), dlqQueue, reason));
     }
 
     private static String originalQueue(Envelope envelope) {
@@ -372,6 +398,7 @@ public final class ArtemisConsumer {
         private String unknownUrn = UnknownUrnStrategy.FAIL;
         private ErrorHandler onError;
         private long receiveTimeoutMillis = 1000;
+        private DeadLetterObserver deadLetterObserver;
 
         private Builder(MessageConsumer consumer, Session session) {
             this.consumer = Objects.requireNonNull(consumer, "consumer");
@@ -414,6 +441,15 @@ public final class ArtemisConsumer {
 
         public Builder receiveTimeout(long millis) {
             this.receiveTimeoutMillis = millis;
+            return this;
+        }
+
+        /**
+         * Optional observer called once per record written to the DLQ, after the send succeeded (ADR-0039 section
+         * 5.1). Failures of the observer are logged and never change the settle outcome.
+         */
+        public Builder deadLetterObserver(DeadLetterObserver deadLetterObserver) {
+            this.deadLetterObserver = deadLetterObserver;
             return this;
         }
 

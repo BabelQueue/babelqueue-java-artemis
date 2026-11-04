@@ -1,7 +1,9 @@
 package com.babelqueue.artemis;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -73,5 +75,37 @@ class JmsMessagesTest {
         Message throwing = mock(Message.class);
         when(throwing.propertyExists("JMSXDeliveryCount")).thenThrow(new JMSException("boom"));
         assertEquals(0, JmsMessages.deliveryCount(throwing));
+    }
+
+    @Test
+    void propertyNameLegalityFollowsJmsIdentifierRules() {
+        assertTrue(JmsMessages.isLegalPropertyName("traceparent"));
+        assertTrue(JmsMessages.isLegalPropertyName("tracestate"));
+        assertTrue(JmsMessages.isLegalPropertyName("bq_replay_bypass"));
+        assertFalse(JmsMessages.isLegalPropertyName("bq-replay-bypass"));
+        assertFalse(JmsMessages.isLegalPropertyName("JMSXGroupID"));
+        assertFalse(JmsMessages.isLegalPropertyName("NULL"));
+        assertFalse(JmsMessages.isLegalPropertyName("1abc"));
+        assertTrue(JmsMessages.isLegalPropertyName("trace\uD835\uDC1Aparent")); // supplementary-plane letter
+        assertFalse(JmsMessages.isLegalPropertyName(""));
+        assertFalse(JmsMessages.isLegalPropertyName(null));
+    }
+
+    @Test
+    void toMapSurfacesStringPropertiesAndToleratesNullUnreadableAndNonStrings() throws Exception {
+        Message message = mock(Message.class);
+        when(message.getPropertyNames()).thenReturn(
+            java.util.Collections.enumeration(java.util.List.of("traceparent", "blank", "JMSXDeliveryCount")));
+        when(message.getObjectProperty("traceparent")).thenReturn("00-x");
+        when(message.getObjectProperty("blank")).thenReturn("");
+        when(message.getObjectProperty("JMSXDeliveryCount")).thenReturn(2);
+
+        assertEquals(java.util.Map.of("traceparent", "00-x"), JmsMessages.toMap(message));
+        assertTrue(JmsMessages.toMap(null).isEmpty());
+        assertTrue(JmsMessages.toMap(mock(Message.class)).isEmpty()); // null enumeration
+        Message throwing = mock(Message.class);
+        when(throwing.getPropertyNames()).thenThrow(new JMSException("boom"));
+        assertTrue(JmsMessages.toMap(throwing).isEmpty());
+        assertTrue(BabelHandler.headersOf(null).isEmpty());
     }
 }

@@ -1,7 +1,10 @@
 package com.babelqueue.artemis;
 
+import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
@@ -13,6 +16,8 @@ import jakarta.jms.Queue;
 import jakarta.jms.Session;
 import jakarta.jms.TextMessage;
 import java.time.Duration;
+import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.Map;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
@@ -100,5 +105,102 @@ class ArtemisPublisherTest {
         verify(session).createTextMessage(body.capture());
         org.junit.jupiter.api.Assertions.assertFalse(
             EnvelopeCodec.decode(body.getValue()).traceId().isEmpty());
+    }
+
+    private static final String TRACEPARENT = "00-0af7651916cd43dd8448eb211c80319c-b7ad6b7169203331-01";
+
+    /** A TextMessage mock backed by a real property store, so what is set can be read back (round-trip). */
+    static TextMessage storingMessage(Map<String, Object> store) throws Exception {
+        TextMessage message = mock(TextMessage.class);
+        doAnswer(inv -> store.put(inv.getArgument(0), inv.getArgument(1)))
+            .when(message).setStringProperty(anyString(), anyString());
+        when(message.propertyExists(anyString())).thenAnswer(inv -> store.containsKey((String) inv.getArgument(0)));
+        when(message.getObjectProperty(anyString())).thenAnswer(inv -> store.get((String) inv.getArgument(0)));
+        when(message.getPropertyNames()).thenAnswer(inv -> Collections.enumeration(store.keySet()));
+        return message;
+    }
+
+    @Test
+    void publishWithHeadersCarriesTraceparentBesideContractPropertiesAndNotInTheBody() throws Exception {
+        Map<String, Object> store = new LinkedHashMap<>();
+        TextMessage message = storingMessage(store);
+        Session session = sessionReturning(message);
+        Envelope env = EnvelopeCodec.make(URN, Map.of("order_id", 7), "orders", "trace-1");
+
+        String id = ArtemisPublisher.create(session, producerOn("orders"))
+            .publishWithHeaders(env, Map.of("traceparent", TRACEPARENT, "tracestate", "vendor=1"));
+
+        assertEquals(env.meta().id(), id);
+        assertEquals(TRACEPARENT, store.get("traceparent"));
+        assertEquals("vendor=1", store.get("tracestate"));
+        assertEquals("1", store.get("bq_schema_version")); // contract projection intact
+        ArgumentCaptor<String> body = ArgumentCaptor.forClass(String.class);
+        verify(session).createTextMessage(body.capture());
+        assertFalse(body.getValue().contains("traceparent"));
+        assertFalse(body.getValue().contains(TRACEPARENT));
+        assertEquals(EnvelopeCodec.encode(env), body.getValue());
+    }
+
+    @Test
+    void headerlessPublishWithHeadersSetsExactlyTheContractProperties() throws Exception {
+        Map<String, Object> plain = new LinkedHashMap<>();
+        Map<String, Object> withNull = new LinkedHashMap<>();
+        Map<String, Object> withEmpty = new LinkedHashMap<>();
+        Envelope env = EnvelopeCodec.make(URN, Map.of(), "orders", "trace-1");
+
+        ArtemisPublisher.create(sessionReturning(storingMessage(plain)), producerOn("orders"))
+            .publishWithHeaders(env, null);
+        ArtemisPublisher.create(sessionReturning(storingMessage(withNull)), producerOn("orders"))
+            .publishWithHeaders(env, Map.of());
+        ArtemisPublisher.create(sessionReturning(storingMessage(withEmpty)), producerOn("orders"))
+            .publishWithHeaders(env, Map.of("traceparent", ""));
+
+        assertEquals(plain, withNull);
+        assertEquals(plain, withEmpty);
+        assertFalse(plain.containsKey("traceparent"));
+    }
+
+    @Test
+    void contractPropertyWinsACollisionAndIllegalJmsNamesAreSkipped() throws Exception {
+        Map<String, Object> store = new LinkedHashMap<>();
+        Envelope env = EnvelopeCodec.make(URN, Map.of(), "orders", "trace-1");
+
+        ArtemisPublisher.create(sessionReturning(storingMessage(store)), producerOn("orders"))
+            .publishWithHeaders(env, Map.of(
+                "bq_attempts", "99", "x-hyphen", "v", "JMSXGroupID", "g", "JMSType", "t", "1bad", "v",
+                "traceparent", TRACEPARENT));
+
+        assertEquals("0", store.get("bq_attempts"));
+        assertFalse(store.containsKey("x-hyphen"));
+        assertFalse(store.containsKey("JMSXGroupID"));
+        assertFalse(store.containsKey("JMSType"));
+        assertFalse(store.containsKey("1bad"));
+        assertEquals(TRACEPARENT, store.get("traceparent"));
+    }
+
+    @Test
+    void publishOverloadWithHeadersRidesTheDelayedMessageToo() throws Exception {
+        Map<String, Object> store = new LinkedHashMap<>();
+        MessageProducer producer = producerOn("orders");
+
+        ArtemisPublisher.create(sessionReturning(storingMessage(store)), producer)
+            .publish(URN, Map.of(), null, Duration.ofSeconds(30), Map.of("traceparent", TRACEPARENT));
+
+        assertEquals(TRACEPARENT, store.get("traceparent"));
+        assertEquals("30000", store.get("bq_delay"));
+        verify(producer).setDeliveryDelay(30000L);
+    }
+
+    @Test
+    void publishWithHeadersMatchesTheOtelHeaderSenderContract() throws Exception {
+        Map<String, Object> store = new LinkedHashMap<>();
+        ArtemisPublisher publisher = ArtemisPublisher.create(
+            sessionReturning(storingMessage(store)), producerOn("orders"));
+        com.babelqueue.otel.HeaderSender sender = publisher::publishWithHeaders;
+
+        assertDoesNotThrow(() -> sender.send(EnvelopeCodec.make(URN, Map.of(), "orders", "t"),
+            Map.of("traceparent", TRACEPARENT)));
+
+        assertEquals(TRACEPARENT, store.get("traceparent"));
     }
 }
